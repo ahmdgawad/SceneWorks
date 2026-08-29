@@ -536,34 +536,95 @@ fn candidate_exclusion(
     Ok(CandidateCurrency::Current)
 }
 
-/// Opt-in (`SCENEWORKS_MEMORY_PREFER_OFFLOAD`): prefer a verified sequential-offload strategy over
-/// `Resident` when one is admissible and fits, halving the resident VRAM footprint at a latency
-/// cost. Off by default; any of `1` / `true` / `yes` / `on` (case-insensitive) enables it.
+/// Caller preference for how aggressively [`select_strategy`] trades latency for a smaller resident
+/// VRAM footprint.
 ///
-/// This is a lossless memory lever: it only ever swaps a heavier `Resident` selection for a lighter
-/// rung the provider has already parity-verified against that same baseline (see
-/// [`select_strategy_inner`]). It never changes the numeric tier, precision, or the candidate set —
-/// so output is unchanged; only peak residency and latency move.
-fn memory_prefers_offload() -> bool {
-    std::env::var("SCENEWORKS_MEMORY_PREFER_OFFLOAD")
-        .ok()
-        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+/// Every non-[`Default`](MemoryPreference::Default) mode is LOSSLESS: it only ever prefers a rung the
+/// provider has already parity-verified against the resident baseline (see [`select_strategy_with`]),
+/// so output is unchanged — only peak residency and latency move. It never changes the numeric tier,
+/// the precision, or the candidate set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MemoryPreference {
+    /// Normative order: the first fitting rung wins, `Resident` first (maximum residency / speed).
+    #[default]
+    Default,
+    /// Prefer the first verified sequential-offload rung (`StagedResidency`, ~2x lighter) over
+    /// `Resident` when it also fits. Falls back to `Resident` when nothing lighter is admissible.
+    PreferOffload,
+    /// Prefer the DEEPEST verified rung that fits — the largest lossless reduction (bounded
+    /// transformer / attention / decode), not merely the first lighter one. Falls back through
+    /// `PreferOffload` down to `Resident`.
+    MaxOffload,
+}
+
+impl MemoryPreference {
+    /// Process-wide default from `SCENEWORKS_MEMORY_PREFER_OFFLOAD`:
+    /// `1`/`true`/`yes`/`on`/`offload` → [`PreferOffload`](Self::PreferOffload);
+    /// `2`/`max`/`aggressive`/`deep` → [`MaxOffload`](Self::MaxOffload);
+    /// unset / anything else → [`Default`](Self::Default). Case-insensitive.
+    pub fn from_env() -> Self {
+        std::env::var("SCENEWORKS_MEMORY_PREFER_OFFLOAD")
+            .ok()
+            .map(|raw| Self::from_token(raw.trim()))
+            .unwrap_or(Self::Default)
+    }
+
+    /// Per-job override read from the request JSON: the string `memoryPreference` /
+    /// `advanced.memoryPreference` (`"resident"` / `"offload"` / `"max"`), or the boolean `lowVram` /
+    /// `advanced.lowVram` (`true` → [`PreferOffload`](Self::PreferOffload)). Returns `None` when the
+    /// request expresses no preference, so a caller can fall back to [`from_env`](Self::from_env).
+    /// Case-insensitive.
+    pub fn from_request(request: &serde_json::Value) -> Option<Self> {
+        let advanced = request.get("advanced");
+        if let Some(token) = request
+            .get("memoryPreference")
+            .or_else(|| advanced.and_then(|a| a.get("memoryPreference")))
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(Self::from_token(token.trim()));
+        }
+        match request
+            .get("lowVram")
+            .or_else(|| advanced.and_then(|a| a.get("lowVram")))
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => Some(Self::PreferOffload),
+            Some(false) => Some(Self::Default),
+            None => None,
+        }
+    }
+
+    fn from_token(token: &str) -> Self {
+        match token.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "offload" | "staged" | "sequential" => Self::PreferOffload,
+            "2" | "max" | "aggressive" | "deep" | "bounded" => Self::MaxOffload,
+            _ => Self::Default,
+        }
+    }
+
+    const fn defers_resident(self) -> bool {
+        !matches!(self, Self::Default)
+    }
+
+    const fn prefers_deepest(self) -> bool {
+        matches!(self, Self::MaxOffload)
+    }
 }
 
 /// Select the first fitting candidate in the normative resident → staged → bounded-decode →
 /// bounded-attention → bounded-transformer order.
 ///
-/// With `SCENEWORKS_MEMORY_PREFER_OFFLOAD` set, a verified sequential-offload rung is preferred over
-/// `Resident` when it also fits (see [`select_strategy_inner`]); the default order is unchanged.
+/// The active [`MemoryPreference`] is read from `SCENEWORKS_MEMORY_PREFER_OFFLOAD`; to drive it
+/// per-job instead, call [`select_strategy_with`] with [`MemoryPreference::from_request`]. The
+/// default order is unchanged when no preference is set.
 pub fn select_strategy(
     request: RequestScope<'_>,
     contract: &MemoryProviderContract,
     budget: Option<Budget>,
     candidates: &[Candidate<'_>],
 ) -> Selection {
-    select_strategy_inner(
-        memory_prefers_offload(),
+    select_strategy_with(
+        MemoryPreference::from_env(),
         request,
         contract,
         budget,
@@ -571,18 +632,18 @@ pub fn select_strategy(
     )
 }
 
-/// The order-preferring core. When `prefer_offload` is set, a fitting `Resident` selection is
-/// DEFERRED rather than returned, so a lighter verified rung deeper in [`MemoryStrategy::ALL`]
-/// (`StagedResidency` first — the ~2x-lighter sequential-offload tier) can win instead. If nothing
-/// lighter is admissible, the deferred `Resident` selection is restored, so a config that runs today
-/// never regresses to a rejection.
+/// The order-preferring core. `preference` decides whether a fitting `Resident` selection is
+/// returned immediately (`Default`), DEFERRED so the first verified sequential-offload rung wins
+/// (`PreferOffload`), or deferred so the DEEPEST verified fitting rung wins (`MaxOffload`). When no
+/// lighter rung is admissible the deferred `Resident` selection is restored, so a config that runs
+/// today never regresses to a rejection.
 ///
 /// Quality is preserved by construction: every non-`Resident` rung that reaches selection has
 /// already cleared [`MemoryEvidence::optimized_eligibility`], which requires a PASSED memory-parity
 /// contract against the resident baseline. The streamed strategy is therefore a verified numerical
 /// equivalent of the pinned one — it differs only in residency (peak VRAM) and latency, not output.
-fn select_strategy_inner(
-    prefer_offload: bool,
+pub fn select_strategy_with(
+    preference: MemoryPreference,
     request: RequestScope<'_>,
     contract: &MemoryProviderContract,
     budget: Option<Budget>,
@@ -613,10 +674,13 @@ fn select_strategy_inner(
     let estimate_margin = estimate_margin(contract.backend.backend_kind());
     let mut deepest = None;
     let mut first_unknown = None;
-    // Opt-in offload preference: a fitting `Resident` pick is parked here and only returned after
-    // the whole ladder has been scanned for a lighter verified rung. Stays `None` (and the branch
-    // below is dead) when `prefer_offload` is false, so default selection is byte-for-byte identical.
+    // Offload preference bookkeeping. A fitting `Resident` pick is parked in `resident_fallback` and
+    // only restored if no lighter verified rung fits. Under `MaxOffload`, each fitting non-`Resident`
+    // rung overwrites `deepest_offload` as the ladder descends shallow → deep, so the last one stored
+    // is the deepest. Both stay `None` under `MemoryPreference::Default`, so the branches below are
+    // dead and default selection is byte-for-byte identical.
     let mut resident_fallback: Option<Selection> = None;
+    let mut deepest_offload: Option<Selection> = None;
     for strategy in MemoryStrategy::ALL {
         let support = contract
             .capability(strategy)
@@ -787,12 +851,20 @@ fn select_strategy_inner(
                 needed_gb,
                 available_gb,
             };
-            // Lossless VRAM halving (opt-in): defer a fitting `Resident` pick and keep scanning for
-            // a verified sequential-offload rung deeper in the ladder. Only `Resident` is ever
-            // deferred; it is restored after the loop when no lighter rung fits, so behavior is
-            // unchanged unless a parity-verified offload strategy is actually available and fits.
-            if prefer_offload && candidate.selection.strategy == MemoryStrategy::Resident {
-                resident_fallback.get_or_insert(selected);
+            // Lossless VRAM reduction (opt-in): defer a fitting pick and keep scanning for a lighter
+            // verified rung. `Resident` is always deferred under any offload preference and restored
+            // after the loop if nothing lighter fits. Under `PreferOffload` the first lighter rung
+            // returns immediately (~2x); under `MaxOffload` lighter rungs are parked so the deepest
+            // fitting one wins. `Default` returns immediately, so behavior is unchanged.
+            if candidate.selection.strategy == MemoryStrategy::Resident {
+                if preference.defers_resident() {
+                    resident_fallback.get_or_insert(selected);
+                    continue;
+                }
+                return selected;
+            }
+            if preference.prefers_deepest() {
+                deepest_offload = Some(selected);
                 continue;
             }
             return selected;
@@ -804,8 +876,13 @@ fn select_strategy_inner(
             .expect("eligible rung is non-empty");
         deepest = Some(deepest.map_or(minimum, |current: f64| current.min(minimum)));
     }
+    // `MaxOffload`: the deepest verified rung that fit wins over every shallower one (and over the
+    // deferred `Resident`). Only ever set when `preference.prefers_deepest()`.
+    if let Some(selected) = deepest_offload {
+        return selected;
+    }
     // No lighter verified rung fit the budget, so honor the deferred `Resident` pick rather than
-    // rejecting a job that the default order would have run. Only reachable with `prefer_offload`.
+    // rejecting a job that the default order would have run. Only reachable under an offload preference.
     if let Some(selected) = resident_fallback {
         return selected;
     }
@@ -1523,7 +1600,7 @@ mod tests {
         });
         // Default preference is unchanged: `Resident` fits and wins.
         assert!(matches!(
-            select_strategy_inner(false, request(), &provider, budget, &candidates),
+            select_strategy_with(MemoryPreference::Default, request(), &provider, budget, &candidates),
             Selection::Selected {
                 selection: MemorySelection {
                     strategy: MemoryStrategy::Resident,
@@ -1534,7 +1611,7 @@ mod tests {
         ));
         // Opt-in: the verified sequential-offload rung is preferred even though `Resident` also fits.
         assert!(matches!(
-            select_strategy_inner(true, request(), &provider, budget, &candidates),
+            select_strategy_with(MemoryPreference::PreferOffload, request(), &provider, budget, &candidates),
             Selection::Selected {
                 selection: MemorySelection {
                     strategy: MemoryStrategy::StagedResidency,
@@ -1584,7 +1661,7 @@ mod tests {
             reserved_headroom_gb: 0.0,
         });
         assert!(matches!(
-            select_strategy_inner(true, request(), &provider, budget, &candidates),
+            select_strategy_with(MemoryPreference::PreferOffload, request(), &provider, budget, &candidates),
             Selection::Selected {
                 selection: MemorySelection {
                     strategy: MemoryStrategy::Resident,
@@ -1593,6 +1670,120 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn max_offload_prefers_the_deepest_verified_fitting_rung() {
+        // Resident (20 GiB), StagedResidency (8 GiB) and BoundedDecode (4 GiB) all fit a 20 GiB
+        // budget and are all parity-verified. `PreferOffload` stops at the first lighter rung
+        // (StagedResidency, ~2x); `MaxOffload` must descend to the deepest fitting rung
+        // (BoundedDecode) for the largest lossless reduction.
+        let mut resident = evidence(MemoryStrategy::Resident);
+        resident.conformance = MemoryConformanceState::ImplementedUnverified;
+        resident.predicted_peak_bytes = 20 * 1024 * 1024 * 1024;
+        let mut staged = evidence(MemoryStrategy::StagedResidency);
+        staged.predicted_peak_bytes = 8 * 1024 * 1024 * 1024;
+        let mut bounded_decode = evidence(MemoryStrategy::BoundedDecode);
+        bounded_decode.predicted_peak_bytes = 4 * 1024 * 1024 * 1024;
+        let candidates = [
+            Candidate {
+                selection: MemorySelection {
+                    strategy: MemoryStrategy::Resident,
+                    parameters: Default::default(),
+                    tier: tier(),
+                },
+                evidence: &resident,
+                closure_digest: INF,
+                basis: CandidateBasis::Measured,
+            },
+            Candidate {
+                selection: MemorySelection {
+                    strategy: MemoryStrategy::StagedResidency,
+                    parameters: Default::default(),
+                    tier: tier(),
+                },
+                evidence: &staged,
+                closure_digest: INF,
+                basis: CandidateBasis::Measured,
+            },
+            Candidate {
+                selection: MemorySelection {
+                    strategy: MemoryStrategy::BoundedDecode,
+                    parameters: params(MemoryStrategy::BoundedDecode),
+                    tier: tier(),
+                },
+                evidence: &bounded_decode,
+                closure_digest: INF,
+                basis: CandidateBasis::Measured,
+            },
+        ];
+        let mut provider = contract();
+        for strategy in [
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ] {
+            provider
+                .strategies
+                .iter_mut()
+                .find(|capability| capability.strategy == strategy)
+                .unwrap()
+                .support = MemoryStrategySupport::Missing;
+        }
+        let budget = Some(Budget {
+            available_gb: 20.0,
+            reclaimable_gb: 0.0,
+            total_gb: 20.0,
+            reserved_headroom_gb: 0.0,
+        });
+        assert!(matches!(
+            select_strategy_with(MemoryPreference::PreferOffload, request(), &provider, budget, &candidates),
+            Selection::Selected {
+                selection: MemorySelection {
+                    strategy: MemoryStrategy::StagedResidency,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            select_strategy_with(MemoryPreference::MaxOffload, request(), &provider, budget, &candidates),
+            Selection::Selected {
+                selection: MemorySelection {
+                    strategy: MemoryStrategy::BoundedDecode,
+                    ..
+                },
+                needed_gb: 4.0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn memory_preference_parses_env_tokens_and_request_fields() {
+        assert_eq!(MemoryPreference::from_token("1"), MemoryPreference::PreferOffload);
+        assert_eq!(MemoryPreference::from_token("Offload"), MemoryPreference::PreferOffload);
+        assert_eq!(MemoryPreference::from_token("MAX"), MemoryPreference::MaxOffload);
+        assert_eq!(MemoryPreference::from_token("aggressive"), MemoryPreference::MaxOffload);
+        assert_eq!(MemoryPreference::from_token("resident"), MemoryPreference::Default);
+        assert_eq!(MemoryPreference::from_token("0"), MemoryPreference::Default);
+
+        assert_eq!(MemoryPreference::from_request(&serde_json::json!({})), None);
+        assert_eq!(
+            MemoryPreference::from_request(&serde_json::json!({"memoryPreference": "max"})),
+            Some(MemoryPreference::MaxOffload)
+        );
+        assert_eq!(
+            MemoryPreference::from_request(&serde_json::json!({"advanced": {"memoryPreference": "offload"}})),
+            Some(MemoryPreference::PreferOffload)
+        );
+        assert_eq!(
+            MemoryPreference::from_request(&serde_json::json!({"lowVram": true})),
+            Some(MemoryPreference::PreferOffload)
+        );
+        assert_eq!(
+            MemoryPreference::from_request(&serde_json::json!({"advanced": {"lowVram": false}})),
+            Some(MemoryPreference::Default)
+        );
     }
 
     #[test]
