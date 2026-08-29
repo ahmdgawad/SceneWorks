@@ -1,0 +1,114 @@
+name: Release macOS (fork)
+
+# Fork-friendly macOS release pipeline for ahmdgawad/SceneWorks.
+#
+# The upstream `release.yml` builds the SIGNED + NOTARIZED DMG on a self-hosted
+# `nax` signing Mac (macOS 26.2) using Apple Developer ID + App Store Connect
+# secrets, and is gated to `github.repository == 'SceneWorks/SceneWorks'` — none of
+# that infrastructure exists on a fork. This lane reproduces the macOS package on a
+# GitHub-hosted Apple Silicon runner instead, with two necessary adaptations:
+#
+#   * UNSIGNED / ad-hoc: a fork has no Developer ID cert, so `APPLE_SIGNING_IDENTITY=-`
+#     plus a `--config` overlay override the committed signingIdentity to "-" (ad-hoc).
+#     No notarization is attempted (the APPLE_API_* env is never set).
+#   * DEPLOYMENT TARGET 15.0: hosted macOS runners cap at SDK 15, but the workspace
+#     pins MACOSX_DEPLOYMENT_TARGET=26.2 for MLX's NAX Metal kernels. .cargo/config.toml
+#     documents the escape hatch — export 15.0 to build "for correctness only" (the NAX
+#     fast path just compiles out; harmless in CI).
+#
+# Triggered by pushing a `v*` tag (or manual dispatch). Builds the .app + .dmg via the
+# same `tauri build` path upstream uses, then creates a GitHub Release with the DMG.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build & release (e.g. v0.8.7-fork.1)"
+        required: true
+
+permissions:
+  contents: write # create the release + upload the DMG
+
+concurrency:
+  group: release-macos-fork-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    # Fork-only, hosted Apple Silicon (macos-14/15 default to arm64).
+    if: ${{ github.repository == 'ahmdgawad/SceneWorks' }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_NET_OFFLINE: "true"
+      # Hosted runners can't provide SDK >= 26.2; build at the runner's cap. See the
+      # MACOSX_DEPLOYMENT_TARGET note in /.cargo/config.toml.
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+
+      # Pull the pinned SceneWorks/inference release (public; no token needed).
+      - name: Fetch the pinned inference release
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo fetch --locked
+
+      # apps/web = the embedded UI; apps/desktop = the @tauri-apps/cli. The repo root
+      # only orchestrates and has no JS deps of its own.
+      - name: Install web + desktop JS deps
+        run: |
+          npm ci --prefix apps/web
+          npm ci --prefix apps/desktop
+
+      # `tauri build` runs beforeBuildCommand (build-sidecar.mjs → builds the
+      # sceneworks-api sidecar incl. MLX-from-source + stages ffmpeg/onnxruntime/mlx
+      # resources), then packages the .app and .dmg. The overlay + env force an
+      # ad-hoc signature so the build doesn't demand the absent Developer ID cert.
+      - name: Build unsigned macOS bundle (.app + .dmg)
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: |
+          cat > "$RUNNER_TEMP/fork-unsigned.conf.json" <<'JSON'
+          { "bundle": { "macOS": { "signingIdentity": "-" } } }
+          JSON
+          npm --prefix apps/desktop run build -- \
+            --bundles app,dmg \
+            --config "$RUNNER_TEMP/fork-unsigned.conf.json"
+
+      - name: Create GitHub Release with the DMG
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          shopt -s nullglob
+          dmgs=(target/release/bundle/dmg/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "No DMG produced under target/release/bundle/dmg/" >&2
+            ls -R target/release/bundle 2>/dev/null || true
+            exit 1
+          fi
+          notes=$(printf '%s\n' \
+            '## macOS (Apple Silicon)' \
+            'Ad-hoc-signed fork build — NOT notarized. On first open macOS Gatekeeper' \
+            'will warn: right-click the app and choose Open, or run' \
+            '`xattr -dr com.apple.quarantine /Applications/SceneWorks.app`.' \
+            '' \
+            'Produced by the fork macOS release pipeline on a GitHub-hosted runner.')
+          args=(--title "SceneWorks $TAG" --notes "$notes")
+          if [[ "${TAG#v}" == *-* ]]; then args+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber "${dmgs[0]}"
+          else
+            gh release create "$TAG" "${args[@]}" "${dmgs[0]}"
+          fi
